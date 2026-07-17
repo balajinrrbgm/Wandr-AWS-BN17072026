@@ -1,0 +1,364 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: >
+  Wandr — Full-stack travel app infrastructure.
+  Aurora PostgreSQL Serverless v2 + VPC + Secrets Manager + Lambda for price alerts.
+
+Parameters:
+  Environment:
+    Type: String
+    Default: prod
+    AllowedValues: [dev, staging, prod]
+    Description: Deployment environment
+
+  DBMasterUsername:
+    Type: String
+    Default: wandr_admin
+    NoEcho: false
+    Description: Aurora master username
+
+  DBMasterPassword:
+    Type: String
+    NoEcho: true
+    MinLength: 12
+    Description: Aurora master password (stored in Secrets Manager)
+
+  VercelCIDR:
+    Type: String
+    Default: 0.0.0.0/0
+    Description: >
+      CIDR range for Vercel serverless functions. In production, restrict to
+      Vercel's published IP ranges or use RDS Proxy with IAM auth instead.
+
+Mappings:
+  EnvironmentConfig:
+    dev:
+      AuroraMinCapacity: 0.5
+      AuroraMaxCapacity: 4
+      MultiAZ: false
+    staging:
+      AuroraMinCapacity: 0.5
+      AuroraMaxCapacity: 16
+      MultiAZ: false
+    prod:
+      AuroraMinCapacity: 0.5
+      AuroraMaxCapacity: 64
+      MultiAZ: true
+
+# ──────────────────────────────────────────────────────────────────────────────
+Resources:
+
+  # ── VPC ─────────────────────────────────────────────────────────────────────
+  WandrVPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/16
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: !Sub wandr-${Environment}-vpc
+        - Key: Project
+          Value: Wandr
+
+  # Public subnets (for NAT gateways)
+  PublicSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WandrVPC
+      CidrBlock: 10.0.1.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub wandr-${Environment}-public-1
+
+  PublicSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WandrVPC
+      CidrBlock: 10.0.2.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      MapPublicIpOnLaunch: true
+      Tags:
+        - Key: Name
+          Value: !Sub wandr-${Environment}-public-2
+
+  # Private subnets (for Aurora)
+  PrivateSubnet1:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WandrVPC
+      CidrBlock: 10.0.10.0/24
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub wandr-${Environment}-private-1
+
+  PrivateSubnet2:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref WandrVPC
+      CidrBlock: 10.0.11.0/24
+      AvailabilityZone: !Select [1, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: !Sub wandr-${Environment}-private-2
+
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+
+  IGWAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref WandrVPC
+      InternetGatewayId: !Ref InternetGateway
+
+  PublicRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref WandrVPC
+
+  PublicRoute:
+    Type: AWS::EC2::Route
+    DependsOn: IGWAttachment
+    Properties:
+      RouteTableId: !Ref PublicRouteTable
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref InternetGateway
+
+  PublicSubnet1RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet1
+      RouteTableId: !Ref PublicRouteTable
+
+  PublicSubnet2RouteAssoc:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PublicSubnet2
+      RouteTableId: !Ref PublicRouteTable
+
+  # ── Security Groups ──────────────────────────────────────────────────────────
+  AuroraSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Aurora PostgreSQL access for Wandr
+      VpcId: !Ref WandrVPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          CidrIp: !Ref VercelCIDR
+          Description: Vercel serverless functions to Aurora PostgreSQL
+        - IpProtocol: tcp
+          FromPort: 5432
+          ToPort: 5432
+          SourceSecurityGroupId: !Ref LambdaSecurityGroup
+          Description: Lambda price alert functions to Aurora
+      Tags:
+        - Key: Name
+          Value: !Sub wandr-${Environment}-aurora-sg
+
+  LambdaSecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Lambda function security group for Wandr
+      VpcId: !Ref WandrVPC
+      SecurityGroupEgress:
+        - IpProtocol: -1
+          CidrIp: 0.0.0.0/0
+      Tags:
+        - Key: Name
+          Value: !Sub wandr-${Environment}-lambda-sg
+
+  # ── Secrets Manager ──────────────────────────────────────────────────────────
+  DBCredentialsSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub wandr/${Environment}/db-credentials
+      Description: Aurora PostgreSQL credentials for Wandr
+      SecretString: !Sub |
+        {
+          "username": "${DBMasterUsername}",
+          "password": "${DBMasterPassword}"
+        }
+      Tags:
+        - Key: Project
+          Value: Wandr
+
+  # ── Aurora PostgreSQL Serverless v2 ─────────────────────────────────────────
+  AuroraDBSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Subnet group for Wandr Aurora cluster
+      SubnetIds:
+        - !Ref PrivateSubnet1
+        - !Ref PrivateSubnet2
+
+  AuroraCluster:
+    Type: AWS::RDS::DBCluster
+    DeletionPolicy: Snapshot
+    Properties:
+      DBClusterIdentifier: !Sub wandr-${Environment}-aurora
+      Engine: aurora-postgresql
+      EngineVersion: '16.2'
+      DatabaseName: wandr
+      MasterUsername: !Sub '{{resolve:secretsmanager:${DBCredentialsSecret}:SecretString:username}}'
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DBCredentialsSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref AuroraDBSubnetGroup
+      VpcSecurityGroupIds:
+        - !Ref AuroraSecurityGroup
+      # Serverless v2 scaling configuration
+      ServerlessV2ScalingConfiguration:
+        MinCapacity: !FindInMap [EnvironmentConfig, !Ref Environment, AuroraMinCapacity]
+        MaxCapacity: !FindInMap [EnvironmentConfig, !Ref Environment, AuroraMaxCapacity]
+      # Enable auto-pause for dev (saves cost)
+      EnableHttpEndpoint: false
+      StorageEncrypted: true
+      BackupRetentionPeriod: !If [IsProd, 30, 7]
+      DeletionProtection: !If [IsProd, true, false]
+      EnableCloudwatchLogsExports:
+        - postgresql
+      Tags:
+        - Key: Project
+          Value: Wandr
+        - Key: Environment
+          Value: !Ref Environment
+
+  AuroraWriterInstance:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      DBInstanceIdentifier: !Sub wandr-${Environment}-writer
+      DBClusterIdentifier: !Ref AuroraCluster
+      DBInstanceClass: db.serverless
+      Engine: aurora-postgresql
+      PubliclyAccessible: false
+
+  # ── Lambda — Price Alert Checker ─────────────────────────────────────────────
+  PriceAlertRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub wandr-${Environment}-price-alert-role
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaVPCAccessExecutionRole
+      Policies:
+        - PolicyName: SecretsManagerAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: secretsmanager:GetSecretValue
+                Resource: !Ref DBCredentialsSecret
+        - PolicyName: SESAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: ses:SendEmail
+                Resource: '*'
+
+  PriceAlertFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub wandr-${Environment}-price-alert-checker
+      Description: Checks flight/hotel prices against user thresholds and sends alerts
+      Runtime: nodejs20.x
+      Handler: index.handler
+      Role: !GetAtt PriceAlertRole.Arn
+      Timeout: 300
+      MemorySize: 512
+      VpcConfig:
+        SecurityGroupIds:
+          - !Ref LambdaSecurityGroup
+        SubnetIds:
+          - !Ref PrivateSubnet1
+          - !Ref PrivateSubnet2
+      Environment:
+        Variables:
+          DB_SECRET_ARN: !Ref DBCredentialsSecret
+          DB_CLUSTER_ENDPOINT: !GetAtt AuroraCluster.Endpoint.Address
+          DB_NAME: wandr
+          AWS_REGION_NAME: !Ref AWS::Region
+      Code:
+        ZipFile: |
+          // Placeholder — deploy actual code via CI/CD pipeline
+          exports.handler = async (event) => {
+            console.log('Price alert checker invoked');
+          };
+      Tags:
+        - Key: Project
+          Value: Wandr
+
+  # EventBridge rule to run price checker every 6 hours
+  PriceAlertSchedule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub wandr-${Environment}-price-alert-schedule
+      Description: Triggers price alert Lambda every 6 hours
+      ScheduleExpression: rate(6 hours)
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt PriceAlertFunction.Arn
+          Id: PriceAlertTarget
+
+  PriceAlertLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref PriceAlertFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt PriceAlertSchedule.Arn
+
+  # ── CloudWatch Alarms ────────────────────────────────────────────────────────
+  AuroraHighCPUAlarm:
+    Type: AWS::CloudWatch::Alarm
+    Properties:
+      AlarmName: !Sub wandr-${Environment}-aurora-high-cpu
+      AlarmDescription: Aurora CPU > 80% for 5 minutes
+      MetricName: CPUUtilization
+      Namespace: AWS/RDS
+      Statistic: Average
+      Period: 300
+      EvaluationPeriods: 1
+      Threshold: 80
+      ComparisonOperator: GreaterThanThreshold
+      Dimensions:
+        - Name: DBClusterIdentifier
+          Value: !Ref AuroraCluster
+
+# ──────────────────────────────────────────────────────────────────────────────
+Conditions:
+  IsProd: !Equals [!Ref Environment, prod]
+
+# ──────────────────────────────────────────────────────────────────────────────
+Outputs:
+  AuroraClusterEndpoint:
+    Description: Aurora cluster writer endpoint (use as DATABASE_URL host)
+    Value: !GetAtt AuroraCluster.Endpoint.Address
+    Export:
+      Name: !Sub wandr-${Environment}-aurora-endpoint
+
+  AuroraClusterPort:
+    Description: Aurora cluster port
+    Value: !GetAtt AuroraCluster.Endpoint.Port
+
+  DBCredentialsSecretARN:
+    Description: Secrets Manager ARN for DB credentials
+    Value: !Ref DBCredentialsSecret
+    Export:
+      Name: !Sub wandr-${Environment}-db-secret-arn
+
+  AuroraClusterARN:
+    Description: Aurora cluster ARN
+    Value: !Sub arn:aws:rds:${AWS::Region}:${AWS::AccountId}:cluster:wandr-${Environment}-aurora
+
+  VpcId:
+    Description: VPC ID
+    Value: !Ref WandrVPC
